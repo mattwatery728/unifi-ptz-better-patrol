@@ -1,0 +1,22 @@
+[Unit]
+Description=UniFi PTZ Patrol with Motion-Aware Tracking
+After=network-online.target unifi-protect.service
+Wants=network-online.target
+Documentation=https://github.com/iceteaSA/unifi-ptz-better-patrol
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/data/ptz-patrol
+ExecStart=/data/ptz-patrol/ptz-patrol.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+# 24h window for log rate limiting
+LogRateLimitIntervalSec=86400
+# Allow 10k logs/day
+LogRateLimitBurst=10000
+
+[Install]
+WantedBy=multi-user.target

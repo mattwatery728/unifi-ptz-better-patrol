@@ -1,0 +1,28 @@
+{
+  "nvr_address": "https://127.0.0.1",
+  "username": "api-user",
+  "password": "changeme",
+  "reauth_seconds": 3600,
+  "auto_discover": true,
+  "log_level": "info",
+
+  "defaults": {
+    "dwell_seconds": 30,
+    "motion_hold_seconds": 15,
+    "max_tracking_wait": 300,
+    "manual_control_hold_seconds": 120,
+    "ptz_settle_seconds": 10,
+    "home_on_shutdown": false
+  },
+
+  "camera_overrides": {
+    "EXAMPLE_CAMERA_ID_HERE": {
+      "enabled": true,
+      "dwell_seconds": 45,
+      "motion_hold_seconds": 20,
+      "max_tracking_wait": 180,
+      "manual_control_hold_seconds": 60,
+      "preset_slots": [0, 1, 3]
+    }
+  }
+}
