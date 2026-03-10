@@ -59,6 +59,75 @@ is_externally_controlled() {
 }
 
 # ---------------------------------------------------------------------------
+# Schedule
+# ---------------------------------------------------------------------------
+
+# Check if the current time falls within a patrol schedule window.
+# Arguments: schedule_start schedule_end schedule_days_json
+#   schedule_start/end: "HH:MM" strings (24h). Empty = no schedule (always active).
+#   schedule_days_json: JSON array of 3-letter day names, e.g. '["mon","tue","wed"]'
+#                       Empty or "null" = all days.
+# Returns 0 if patrol should be active, 1 if outside the schedule window.
+#
+# Day-of-week handling for overnight windows:
+#   For "22:00-06:00" on ["mon","tue","wed","thu","fri"]:
+#   - Friday 23:00 → check Friday (today) → in list → active
+#   - Saturday 01:00 → in early-morning tail, check Friday (yesterday) → in list → active
+#   - Saturday 23:00 → check Saturday (today) → not in list → inactive
+is_within_schedule() {
+  local sched_start=$1 sched_end=$2 sched_days=$3
+
+  # No schedule configured — always active
+  if [[ -z "$sched_start" || -z "$sched_end" ]]; then
+    return 0
+  fi
+
+  # LC_ALL=C forces English day names regardless of system locale
+  local now_hhmm; now_hhmm=$(date +%H:%M)
+  local is_overnight=0
+  [[ "$sched_start" > "$sched_end" ]] && is_overnight=1
+
+  # Determine which time portion we're in and check accordingly
+  local in_window=0
+  if (( is_overnight )); then
+    # Overnight window: e.g. 22:00-06:00
+    if [[ ! "$now_hhmm" < "$sched_start" || "$now_hhmm" < "$sched_end" ]]; then
+      in_window=1
+    fi
+  else
+    # Same-day window: e.g. 08:00-18:00
+    if [[ ! "$now_hhmm" < "$sched_start" && "$now_hhmm" < "$sched_end" ]]; then
+      in_window=1
+    fi
+  fi
+
+  if (( ! in_window )); then
+    return 1
+  fi
+
+  # Check day-of-week if days are specified
+  if [[ -n "$sched_days" && "$sched_days" != "null" ]]; then
+    local check_day
+    if (( is_overnight )) && [[ "$now_hhmm" < "$sched_end" ]]; then
+      # Early-morning tail of an overnight window — check yesterday's day
+      # because the window started the previous calendar day
+      check_day=$(LC_ALL=C date -d "yesterday" +%a 2>/dev/null \
+               || LC_ALL=C date -v-1d +%a 2>/dev/null)
+    else
+      check_day=$(LC_ALL=C date +%a)
+    fi
+    check_day=$(echo "$check_day" | tr '[:upper:]' '[:lower:]')
+
+    local match; match=$(echo "$sched_days" | jq -r --arg d "$check_day" '[.[] | ascii_downcase] | index($d)')
+    if [[ "$match" == "null" ]]; then
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Patrol loop
 # ---------------------------------------------------------------------------
 
@@ -85,6 +154,17 @@ patrol_camera() {
   manual_hold=$(echo "$cam_config" | jq -r '.manual_control_hold_seconds // 120')
   settle_seconds=$(echo "$cam_config" | jq -r '.ptz_settle_seconds // 10')
 
+  # Schedule: optional time window for when patrol should be active
+  local sched_start sched_end sched_days sched_home
+  sched_start=$(echo "$cam_config" | jq -r '.schedule.start // empty')
+  sched_end=$(echo "$cam_config" | jq -r '.schedule.end // empty')
+  sched_days=$(echo "$cam_config" | jq -c '.schedule.days // null')
+  sched_home=$(echo "$cam_config" | jq -r '.schedule.home_on_pause // false')
+
+  if [[ -n "$sched_start" && -n "$sched_end" && "$sched_start" == "$sched_end" ]]; then
+    log "$cam_name" "warn" "Schedule start and end are the same ($sched_start) — patrol will never run. Remove schedule or fix times."
+  fi
+
   # Presets: explicit override or auto-discovered
   local -a presets
   local override_slots
@@ -108,15 +188,49 @@ patrol_camera() {
     return 2  # Permanent condition — caller should not retry frequently
   fi
 
-  log "$cam_name" "info" "Patrol: presets=[${presets[*]}] dwell=${dwell}s hold=${motion_hold}s max_wait=${max_wait}s manual_hold=${manual_hold}s"
+  local sched_info=""
+  if [[ -n "$sched_start" && -n "$sched_end" ]]; then
+    sched_info=" schedule=${sched_start}-${sched_end}"
+    if [[ -n "$sched_days" && "$sched_days" != "null" ]]; then
+      local days_str; days_str=$(echo "$sched_days" | jq -r 'join(",")')
+      sched_info+=" days=${days_str}"
+    fi
+    sched_info+=" home_on_pause=${sched_home}"
+  fi
+  log "$cam_name" "info" "Patrol: presets=[${presets[*]}] dwell=${dwell}s hold=${motion_hold}s max_wait=${max_wait}s manual_hold=${manual_hold}s${sched_info}"
 
   local idx=0
   local last_goto_ts=0
   local expected_zoom=-1
   local external_control_until=0
+  local schedule_paused=0
 
   while true; do
     api_ensure_auth
+
+    # --- Schedule check ---
+    if ! is_within_schedule "$sched_start" "$sched_end" "$sched_days"; then
+      if (( schedule_paused == 0 )); then
+        log "$cam_name" "info" "Outside schedule window (${sched_start}-${sched_end}) — pausing patrol"
+        if [[ "$sched_home" == "true" ]]; then
+          local home_code
+          home_code=$(api_post_with_retry "/cameras/$cam_id/ptz/goto/-1" 2 3) || true
+          if [[ "$home_code" == "200" || "$home_code" == "204" ]]; then
+            log "$cam_name" "info" "Sent to home position"
+          else
+            log "$cam_name" "warn" "Failed to send to home position (HTTP ${home_code:-timeout})"
+          fi
+        fi
+        schedule_paused=1
+      fi
+      sleep 60
+      continue
+    fi
+    if (( schedule_paused == 1 )); then
+      log "$cam_name" "info" "Schedule window active (${sched_start}-${sched_end}) — resuming patrol"
+      schedule_paused=0
+      expected_zoom=-1
+    fi
 
     # --- Backoff if too many consecutive API failures ---
     if (( _CONSECUTIVE_FAILURES >= 3 )); then

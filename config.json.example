@@ -12,7 +12,8 @@
     "max_tracking_wait": 300,
     "manual_control_hold_seconds": 120,
     "ptz_settle_seconds": 10,
-    "home_on_shutdown": false
+    "home_on_shutdown": false,
+    "schedule": null
   },
 
   "camera_overrides": {
@@ -22,7 +23,13 @@
       "motion_hold_seconds": 20,
       "max_tracking_wait": 180,
       "manual_control_hold_seconds": 60,
-      "preset_slots": [0, 1, 3]
+      "preset_slots": [0, 1, 3],
+      "schedule": {
+        "start": "22:00",
+        "end": "06:00",
+        "days": ["mon", "tue", "wed", "thu", "fri"],
+        "home_on_pause": true
+      }
     }
   }
 }

@@ -16,6 +16,7 @@ Tested with: **G5 PTZ** and **G6 PTZ** cameras only. Other UniFi PTZ models may 
 - **Auto-Tracking Hold**: Detects camera auto-tracking state and waits before advancing
 - **Auto-Discovery**: Finds all connected PTZ cameras and their preset positions automatically
 - **Per-Camera Overrides**: Customize dwell time, motion hold, and preset slots per camera
+- **Optional Patrol Schedule**: Restrict patrol to specific time windows and days of the week, with optional "go home" when paused
 - **Parallel Patrol Loops**: Each camera runs its own independent patrol process with isolated auth
 - **Configurable Log Levels**: Control verbosity with `error`, `warn`, `info`, or `debug`
 - **Max Wait Protection**: Configurable timeout prevents indefinite tracking holds
@@ -133,6 +134,51 @@ Add entries under `camera_overrides` keyed by camera ID. Any field from `default
 Apply changes:
 ```bash
 systemctl restart ptz-patrol.service
+```
+
+### Patrol Schedule
+
+By default, patrol runs 24/7. Add a `schedule` block to restrict patrol to specific time windows. This can be set globally in `defaults` or per-camera in `camera_overrides`.
+
+```json
+{
+  "defaults": {
+    "schedule": {
+      "start": "22:00",
+      "end": "06:00",
+      "days": ["mon", "tue", "wed", "thu", "fri"],
+      "home_on_pause": true
+    }
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `start` | — | Start time in 24h format (`"HH:MM"`). Required to enable schedule. |
+| `end` | — | End time in 24h format (`"HH:MM"`). Required to enable schedule. |
+| `days` | all days | Array of 3-letter day names: `"mon"`, `"tue"`, `"wed"`, `"thu"`, `"fri"`, `"sat"`, `"sun"` |
+| `home_on_pause` | `false` | Send camera to home position when patrol pauses outside the schedule window |
+
+Overnight windows work correctly — `"start": "22:00", "end": "06:00"` means patrol is active from 10 PM to 6 AM. Times use the system clock of the device (not UTC) — check with `date` on your NVR to verify the timezone.
+
+If no `schedule` is set (or set to `null`), patrol runs continuously. Per-camera schedules override the global default:
+
+```json
+{
+  "defaults": {
+    "schedule": null
+  },
+  "camera_overrides": {
+    "CAMERA_ID": {
+      "schedule": {
+        "start": "20:00",
+        "end": "07:00",
+        "home_on_pause": true
+      }
+    }
+  }
+}
 ```
 
 ### Log Levels
