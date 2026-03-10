@@ -13,7 +13,7 @@ Tested with: **G5 PTZ** and **G6 PTZ** cameras only. Other UniFi PTZ models may 
 - **Motion-Aware Patrol**: Automatically pauses patrol when motion or smart detection is active
 - **Manual Control Detection**: Detects when you're controlling the camera via the Protect app and backs off — won't interrupt your PTZ session
 - **Active Dwell Monitoring**: Polls for external control and motion every 5 seconds during dwell — reacts within seconds, not minutes
-- **Auto-Tracking Hold**: Detects camera auto-tracking state and waits before advancing
+- **Auto-Tracking Compatible**: Auto-tracking works with this patrol mode — patrol pauses while the camera tracks a subject and resumes when done. UniFi's built-in patrol mode does not support auto-tracking.
 - **Auto-Discovery**: Finds all connected PTZ cameras and their preset positions automatically
 - **Per-Camera Overrides**: Customize dwell time, motion hold, and preset slots per camera
 - **Optional Patrol Schedule**: Restrict patrol to specific time windows and days of the week, with optional "go home" when paused
