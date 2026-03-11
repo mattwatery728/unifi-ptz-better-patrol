@@ -14,6 +14,8 @@ Tested with: **G5 PTZ** and **G6 PTZ** cameras only. Other UniFi PTZ models may 
 - **Manual Control Detection**: Detects when you're controlling the camera via the Protect app and backs off — won't interrupt your PTZ session
 - **Active Dwell Monitoring**: Polls for external control and motion every 5 seconds during dwell — reacts within seconds, not minutes
 - **Auto-Tracking Compatible**: Auto-tracking works with this patrol mode — patrol pauses while the camera tracks a subject and resumes when done. UniFi's built-in patrol mode does not support auto-tracking.
+- **Dynamic Auto-Tracking**: Optionally enables auto-tracking only when a smart detection (e.g. person) occurs, then disables it when the detection clears — giving you the best of both worlds (motion events for patrol + tracking when it matters)
+- **Auto-Setup**: Automatically disables conflicting Protect settings on startup (built-in patrols, return-to-home)
 - **Auto-Discovery**: Finds all connected PTZ cameras and their preset positions automatically
 - **Per-Camera Overrides**: Customize dwell time, motion hold, and preset slots per camera
 - **Optional Patrol Schedule**: Restrict patrol to specific time windows and days of the week, with optional "go home" when paused
@@ -33,8 +35,10 @@ Tested with: **G5 PTZ** and **G6 PTZ** cameras only. Other UniFi PTZ models may 
 Before installing, make sure the following are configured in UniFi Protect:
 
 1. **Local user with admin role** — Create a dedicated local user (e.g. `patrol`) in UniFi OS Settings > Admins with the **Admin** role. This script uses local username/password authentication.
-2. **Disable built-in patrols** — Any active patrol schedules on your PTZ cameras must be disabled in the Protect app. Running both simultaneously will cause conflicts.
-3. **Disable auto return home** — Turn off the "Auto Return to Home Position" toggle for each PTZ camera in Protect > Camera Settings > PTZ. This script manages positioning itself and the auto-home feature will interfere.
+
+The script automatically handles these on startup (no manual action required):
+- **Built-in patrols** — Stopped automatically if running (avoids conflicts)
+- **Auto return home** — Disabled automatically if enabled (the script manages positioning itself)
 
 ## Installation
 
@@ -124,6 +128,7 @@ Edit `/data/ptz-patrol/config.json`:
 | `defaults.manual_control_hold_seconds` | `120` | Backoff time after manual PTZ control detected |
 | `defaults.ptz_settle_seconds` | `10` | Grace period after a goto before checking for drift |
 | `defaults.home_on_shutdown` | `false` | Send cameras to home position on service stop |
+| `defaults.dynamic_auto_tracking` | `false` | Enable dynamic auto-tracking (see below) |
 
 ### Per-Camera Overrides
 
@@ -180,6 +185,32 @@ If no `schedule` is set (or set to `null`), patrol runs continuously. Per-camera
   }
 }
 ```
+
+### Dynamic Auto-Tracking
+
+UniFi Protect suppresses motion events when auto-tracking is enabled (the camera is moving, so there's no relative motion in the frame). This creates a problem: you can't have both motion-aware patrol and auto-tracking at the same time.
+
+Dynamic auto-tracking solves this by keeping auto-tracking **disabled by default** and only enabling it when a smart detection (e.g. person) is actively occurring. When the detection clears, it disables tracking again so motion events resume for the next patrol cycle.
+
+```json
+{
+  "defaults": {
+    "dynamic_auto_tracking": true
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `dynamic_auto_tracking` | `false` | Enable dynamic auto-tracking (person detection only) |
+
+When enabled, the script will:
+1. Disable auto-tracking on the camera at startup
+2. Enable it when a matching smart detection occurs (patrol holds)
+3. Disable it when the detection clears (patrol resumes)
+4. Disable it on shutdown and schedule pause
+
+This is per-camera configurable — you can enable it on specific cameras via `camera_overrides`.
 
 ### Log Levels
 

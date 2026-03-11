@@ -44,6 +44,7 @@ api_cleanup() {
   rm -f "$_COOKIE_TEMP" "$_HEADERS_TEMP" "$_BODY_TEMP"
   local pids
   pids=$(jobs -p)
+  # shellcheck disable=SC2086  # Intentional word-split: $pids is space-separated PID list
   [[ -n "$pids" ]] && kill $pids 2>/dev/null || true
 }
 
@@ -192,6 +193,17 @@ api_post() {
     -b "$_COOKIE_TEMP"
 }
 
+api_patch() {
+  local url=$1 data=$2
+  curl -k -s -o /dev/null -w "%{http_code}" -X PATCH \
+    "$_NVR_ADDRESS/proxy/protect/api$url" \
+    --header "TOKEN: $_TOKEN" \
+    --header "X-CSRF-Token: $_CSRF_TOKEN" \
+    --header "Content-Type: application/json" \
+    -b "$_COOKIE_TEMP" \
+    -d "$data"
+}
+
 # GET with retry: echoes body on success and returns 0; returns 1 on failure.
 # Detects 401/403 and re-authenticates automatically.
 # Uses _LAST_BODY / _LAST_HTTP_CODE globals set by api_get() — no subshell.
@@ -277,8 +289,14 @@ api_backoff_delay() {
 # Returns 0 (true) if camera appears to be tracking or has recent activity.
 # Extracts all needed fields in a single jq call to minimise process spawning
 # on resource-constrained UniFi hardware.
+# Side-effect: sets _LAST_SMART_ACTIVE=1 if smart detection (AI) is active,
+#              0 otherwise. Used by dynamic auto-tracking to avoid a second API call.
+_LAST_SMART_ACTIVE=0
+
 is_tracking() {
   local cam_id=$1 motion_hold=$2
+  _LAST_SMART_ACTIVE=0
+
   local state
   state=$(api_get_with_retry "/cameras/$cam_id" 2 3) || {
     log "$cam_id" "warn" "Failed to fetch camera state — assuming active (fail-safe)"
@@ -315,6 +333,7 @@ is_tracking() {
 
   # Explicit tracking flag (firmware-dependent, may not exist)
   if [[ "$tracking" == "true" ]]; then
+    _LAST_SMART_ACTIVE=1
     return 0
   fi
 
@@ -323,6 +342,7 @@ is_tracking() {
 
   # Recent smart detection
   if (( now_ms - last_smart < hold_ms )); then
+    _LAST_SMART_ACTIVE=1
     return 0
   fi
 

@@ -11,6 +11,7 @@ source "$SCRIPT_DIR/patrol.sh"
 
 _CHILD_PIDS=()
 _CAMERA_IDS=()
+_DYN_TRACKING_IDS=()
 _SHUTTING_DOWN=0
 
 shutdown() {
@@ -24,15 +25,26 @@ shutdown() {
   done
   wait 2>/dev/null || true
 
-  # Optionally send cameras home on shutdown
-  local home_on_shutdown
-  home_on_shutdown=$(cfg '.defaults.home_on_shutdown // false')
-  if [[ "$home_on_shutdown" == "true" && ${#_CAMERA_IDS[@]} -gt 0 ]]; then
+  if [[ ${#_CAMERA_IDS[@]} -gt 0 ]]; then
     api_ensure_auth
-    log "main" "info" "Sending cameras to home position..."
-    for cam_id in "${_CAMERA_IDS[@]}"; do
-      api_post "/cameras/$cam_id/ptz/goto/-1" >/dev/null 2>&1 || true
-    done
+
+    # Disable dynamic auto-tracking on cameras that had it enabled
+    if [[ ${#_DYN_TRACKING_IDS[@]} -gt 0 ]]; then
+      log "main" "info" "Disabling dynamic auto-tracking..."
+      for cam_id in "${_DYN_TRACKING_IDS[@]}"; do
+        api_patch "/cameras/$cam_id" '{"smartDetectSettings":{"autoTrackingObjectTypes":[]}}' >/dev/null 2>&1 || true
+      done
+    fi
+
+    # Optionally send cameras home on shutdown
+    local home_on_shutdown
+    home_on_shutdown=$(cfg '.defaults.home_on_shutdown // false')
+    if [[ "$home_on_shutdown" == "true" ]]; then
+      log "main" "info" "Sending cameras to home position..."
+      for cam_id in "${_CAMERA_IDS[@]}"; do
+        api_post "/cameras/$cam_id/ptz/goto/-1" >/dev/null 2>&1 || true
+      done
+    fi
   fi
 
   log "main" "info" "Shutdown complete"
@@ -89,6 +101,46 @@ for (( i = 0; i < count; i++ )); do
   fi
 
   _CAMERA_IDS+=("$cam_id")
+
+  # --- Auto-setup: disable conflicting Protect settings ---
+
+  # Disable return-to-home if enabled (interferes with patrol positioning)
+  return_home_ms=$(echo "$cam_json" | jq -r '.return_home_ms // "null"')
+  if [[ "$return_home_ms" != "null" ]]; then
+    setup_code=$(api_patch "/cameras/$cam_id" '{"ptz":{"returnHomeAfterInactivityMs":null}}') || true
+    if [[ "$setup_code" == "200" ]]; then
+      log "main" "info" "$cam_name: disabled auto return-to-home (was ${return_home_ms}ms)"
+    else
+      log "main" "warn" "$cam_name: failed to disable auto return-to-home (HTTP ${setup_code:-timeout})"
+    fi
+  fi
+
+  # Stop active built-in patrol if running (conflicts with our patrol)
+  active_patrol=$(echo "$cam_json" | jq -r '.active_patrol_slot // "null"')
+  if [[ "$active_patrol" != "null" ]]; then
+    setup_code=$(api_post "/cameras/$cam_id/ptz/patrol/stop") || true
+    if [[ "$setup_code" == "200" || "$setup_code" == "204" ]]; then
+      log "main" "info" "$cam_name: stopped built-in patrol (was slot $active_patrol)"
+    else
+      log "main" "warn" "$cam_name: failed to stop built-in patrol (HTTP ${setup_code:-timeout})"
+    fi
+  fi
+
+  # Disable auto-tracking on startup if dynamic tracking is configured
+  # (it will be re-enabled dynamically when smart detections occur)
+  dyn_tracking=$(echo "$cam_config" | jq -r '.dynamic_auto_tracking // false')
+  if [[ "$dyn_tracking" == "true" ]]; then
+    _DYN_TRACKING_IDS+=("$cam_id")
+    current_types=$(echo "$cam_json" | jq -c '.auto_tracking_types // []')
+    if [[ "$current_types" != "[]" ]]; then
+      setup_code=$(api_patch "/cameras/$cam_id" '{"smartDetectSettings":{"autoTrackingObjectTypes":[]}}') || true
+      if [[ "$setup_code" == "200" ]]; then
+        log "main" "info" "$cam_name: disabled auto-tracking for dynamic mode (was $current_types)"
+      else
+        log "main" "warn" "$cam_name: failed to disable auto-tracking (HTTP ${setup_code:-timeout})"
+      fi
+    fi
+  fi
 
   # Each camera gets its own subshell with independent auth and temp files.
   # The restart wrapper ensures a single API error doesn't permanently kill

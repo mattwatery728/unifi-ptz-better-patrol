@@ -13,7 +13,8 @@
     "manual_control_hold_seconds": 120,
     "ptz_settle_seconds": 10,
     "home_on_shutdown": false,
-    "schedule": null
+    "schedule": null,
+    "dynamic_auto_tracking": false
   },
 
   "camera_overrides": {
@@ -29,7 +30,8 @@
         "end": "06:00",
         "days": ["mon", "tue", "wed", "thu", "fri"],
         "home_on_pause": true
-      }
+      },
+      "dynamic_auto_tracking": true
     }
   }
 }

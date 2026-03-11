@@ -128,6 +128,29 @@ is_within_schedule() {
 }
 
 # ---------------------------------------------------------------------------
+# Dynamic auto-tracking
+# ---------------------------------------------------------------------------
+
+# Enable or disable auto-tracking on a camera via API PATCH.
+# Arguments: cam_id cam_name types_json action_label
+#   types_json: '["person"]' to enable, '[]' to disable
+#   action_label: "enabled" or "disabled" (for logging)
+set_auto_tracking() {
+  local cam_id=$1 cam_name=$2 types_json=$3 action_label=$4
+  api_ensure_auth
+  local code
+  code=$(api_patch "/cameras/$cam_id" \
+    "{\"smartDetectSettings\":{\"autoTrackingObjectTypes\":$types_json}}") || true
+  if [[ "$code" == "200" ]]; then
+    log "$cam_name" "info" "Auto-tracking $action_label ($types_json)"
+    return 0
+  else
+    log "$cam_name" "warn" "Failed to set auto-tracking (HTTP ${code:-timeout})"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Patrol loop
 # ---------------------------------------------------------------------------
 
@@ -165,6 +188,10 @@ patrol_camera() {
     log "$cam_name" "warn" "Schedule start and end are the same ($sched_start) — patrol will never run. Remove schedule or fix times."
   fi
 
+  # Dynamic auto-tracking: enable tracking on smart detection, disable when clear
+  local dyn_tracking
+  dyn_tracking=$(echo "$cam_config" | jq -r '.dynamic_auto_tracking // false')
+
   # Presets: explicit override or auto-discovered
   local -a presets
   local override_slots
@@ -197,13 +224,18 @@ patrol_camera() {
     fi
     sched_info+=" home_on_pause=${sched_home}"
   fi
-  log "$cam_name" "info" "Patrol: presets=[${presets[*]}] dwell=${dwell}s hold=${motion_hold}s max_wait=${max_wait}s manual_hold=${manual_hold}s${sched_info}"
+  local dyn_info=""
+  if [[ "$dyn_tracking" == "true" ]]; then
+    dyn_info=" dynamic_tracking=on"
+  fi
+  log "$cam_name" "info" "Patrol: presets=[${presets[*]}] dwell=${dwell}s hold=${motion_hold}s max_wait=${max_wait}s manual_hold=${manual_hold}s${sched_info}${dyn_info}"
 
   local idx=0
   local last_goto_ts=0
   local expected_zoom=-1
   local external_control_until=0
   local schedule_paused=0
+  local tracking_enabled=0
 
   while true; do
     api_ensure_auth
@@ -220,6 +252,11 @@ patrol_camera() {
           else
             log "$cam_name" "warn" "Failed to send to home position (HTTP ${home_code:-timeout})"
           fi
+        fi
+        # Disable dynamic auto-tracking while paused
+        if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 1 )); then
+          set_auto_tracking "$cam_id" "$cam_name" "[]" "disabled"
+          tracking_enabled=0
         fi
         schedule_paused=1
       fi
@@ -276,6 +313,12 @@ patrol_camera() {
       if (( waited == 0 )); then
         log "$cam_name" "info" "Tracking/motion active — holding"
       fi
+      # Dynamic auto-tracking: enable when smart detection is active
+      if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 && _LAST_SMART_ACTIVE == 1 )); then
+        if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
+          tracking_enabled=1
+        fi
+      fi
       sleep 5
       waited=$((waited + 5))
       api_ensure_auth
@@ -284,6 +327,13 @@ patrol_camera() {
         break
       fi
     done
+    # Dynamic auto-tracking: disable when detection clears
+    if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 1 )); then
+      set_auto_tracking "$cam_id" "$cam_name" "[]" "disabled"
+      tracking_enabled=0
+      # Reset zoom baseline since tracking may have moved the camera
+      expected_zoom=-1
+    fi
     if (( waited > 0 && waited < max_wait )); then
       log "$cam_name" "debug" "Clear after ${waited}s — resuming"
     fi
@@ -343,6 +393,12 @@ patrol_camera() {
       # Check for new motion/tracking during dwell (catches pan/tilt manual
       # control since motor movement triggers the motion sensor)
       if is_tracking "$cam_id" "$motion_hold"; then
+        # Dynamic auto-tracking: enable when smart detection fires during dwell
+        if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 && _LAST_SMART_ACTIVE == 1 )); then
+          if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
+            tracking_enabled=1
+          fi
+        fi
         log "$cam_name" "info" "Activity during dwell — holding"
         dwell_interrupted=1
         break

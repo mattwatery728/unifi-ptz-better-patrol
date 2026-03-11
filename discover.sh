@@ -29,7 +29,10 @@ discover_ptz_cameras() {
       zoom_position: (.ispSettings.zoomPosition // -1),
       is_person_tracking: (
         .smartDetectSettings.autoTrackingObjectTypes // [] | map(select(. == "person")) | length > 0
-      )
+      ),
+      auto_tracking_types: (.smartDetectSettings.autoTrackingObjectTypes // []),
+      active_patrol_slot: (.activePatrolSlot // null),
+      return_home_ms: (.ptz.returnHomeAfterInactivityMs // null)
     }]
   ')
 
