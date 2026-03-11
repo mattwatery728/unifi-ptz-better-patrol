@@ -13,6 +13,7 @@
     "manual_control_hold_seconds": 120,
     "ptz_settle_seconds": 10,
     "home_on_shutdown": false,
+    "home_between_cycles": false,
     "schedule": null,
     "dynamic_auto_tracking": false
   },

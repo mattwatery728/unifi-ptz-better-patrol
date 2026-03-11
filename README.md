@@ -99,7 +99,8 @@ Edit `/data/ptz-patrol/config.json`:
     "max_tracking_wait": 300,
     "manual_control_hold_seconds": 120,
     "ptz_settle_seconds": 10,
-    "home_on_shutdown": false
+    "home_on_shutdown": false,
+    "home_between_cycles": false
   },
 
   "camera_overrides": {
@@ -129,6 +130,7 @@ Edit `/data/ptz-patrol/config.json`:
 | `defaults.manual_control_hold_seconds` | `120` | Backoff time after manual PTZ control detected |
 | `defaults.ptz_settle_seconds` | `10` | Grace period after a goto before checking for drift |
 | `defaults.home_on_shutdown` | `false` | Send cameras to home position on service stop |
+| `defaults.home_between_cycles` | `false` | Go to home position after completing a full preset cycle before starting again |
 | `defaults.dynamic_auto_tracking` | `false` | Enable dynamic auto-tracking (see below) |
 
 ### Per-Camera Overrides

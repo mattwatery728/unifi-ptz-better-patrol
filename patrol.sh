@@ -151,6 +151,75 @@ set_auto_tracking() {
 }
 
 # ---------------------------------------------------------------------------
+# Home-between-cycles dwell
+# ---------------------------------------------------------------------------
+
+# Send the camera to its home position and dwell there for the configured
+# dwell time, polling for motion/tracking and external control exactly like
+# a normal preset dwell.
+#
+# Arguments: cam_id cam_name dwell motion_hold settle_seconds manual_hold
+#            dyn_tracking
+#
+# Reads/writes these caller-scope variables directly (not local to this
+# function, shared via bash dynamic scoping):
+#   last_goto_ts  expected_zoom  tracking_enabled  external_control_until
+#
+# Returns 0 if dwell completed normally, 1 if interrupted (caller should
+# continue back to the top of the main patrol loop).
+_patrol_home_dwell() {
+  local cam_id=$1 cam_name=$2 dwell=$3 motion_hold=$4 settle_seconds=$5
+  local manual_hold=$6 dyn_tracking=$7
+
+  local hbc_code
+  hbc_code=$(api_post_with_retry "/cameras/$cam_id/ptz/goto/-1" 2 3) || true
+
+  if [[ "$hbc_code" != "200" && "$hbc_code" != "204" ]]; then
+    log "$cam_name" "warn" "Failed to go home between cycles (HTTP ${hbc_code:-timeout})"
+    return 0  # Not interrupted — just skip the home dwell
+  fi
+
+  log "$cam_name" "info" "→ Home (between cycles) [HTTP $hbc_code]"
+  last_goto_ts=$(date +%s)
+  expected_zoom=-1
+
+  local hbc_remaining=$dwell
+  while (( hbc_remaining > 0 )); do
+    local hbc_poll
+    hbc_poll=$(( hbc_remaining < 5 ? hbc_remaining : 5 ))
+    sleep "$hbc_poll"
+    hbc_remaining=$(( hbc_remaining - hbc_poll ))
+
+    # Sample zoom once after settle window
+    local now
+    now=$(date +%s)
+    if (( expected_zoom < 0 && now - last_goto_ts >= settle_seconds )); then
+      expected_zoom=$(api_get_zoom_position "$cam_id")
+    fi
+
+    # Check for external control (zoom drift)
+    if is_externally_controlled "$cam_id" "$cam_name" "$settle_seconds" "$last_goto_ts" "$expected_zoom"; then
+      external_control_until=$(( $(date +%s) + manual_hold ))
+      log "$cam_name" "info" "External control detected during home dwell — holding patrol for ${manual_hold}s"
+      return 1
+    fi
+
+    # Check for motion/tracking
+    if is_tracking "$cam_id" "$motion_hold"; then
+      if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 && _LAST_SMART_ACTIVE == 1 )); then
+        if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
+          tracking_enabled=1
+        fi
+      fi
+      log "$cam_name" "info" "Activity during home dwell — holding"
+      return 1
+    fi
+  done
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Patrol loop
 # ---------------------------------------------------------------------------
 
@@ -187,6 +256,10 @@ patrol_camera() {
   if [[ -n "$sched_start" && -n "$sched_end" && "$sched_start" == "$sched_end" ]]; then
     log "$cam_name" "warn" "Schedule start and end are the same ($sched_start) — patrol will never run. Remove schedule or fix times."
   fi
+
+  # Home between cycles: go to home position after cycling through all presets
+  local home_between_cycles
+  home_between_cycles=$(echo "$cam_config" | jq -r '.home_between_cycles // false')
 
   # Dynamic auto-tracking: enable tracking on smart detection, disable when clear
   local dyn_tracking
@@ -228,7 +301,11 @@ patrol_camera() {
   if [[ "$dyn_tracking" == "true" ]]; then
     dyn_info=" dynamic_tracking=on"
   fi
-  log "$cam_name" "info" "Patrol: presets=[${presets[*]}] dwell=${dwell}s hold=${motion_hold}s max_wait=${max_wait}s manual_hold=${manual_hold}s${sched_info}${dyn_info}"
+  local home_cycle_info=""
+  if [[ "$home_between_cycles" == "true" ]]; then
+    home_cycle_info=" home_between_cycles=on"
+  fi
+  log "$cam_name" "info" "Patrol: presets=[${presets[*]}] dwell=${dwell}s hold=${motion_hold}s max_wait=${max_wait}s manual_hold=${manual_hold}s${sched_info}${dyn_info}${home_cycle_info}"
 
   local idx=0
   local last_goto_ts=0
@@ -336,6 +413,13 @@ patrol_camera() {
       # Advance to next preset — tracking served as the dwell for this one,
       # so don't snap back to the same position the camera just tracked away from
       idx=$(( (idx + 1) % ${#presets[@]} ))
+      # Home between cycles: visit home position when cycle wraps
+      if [[ "$home_between_cycles" == "true" ]] && (( idx == 0 )); then
+        if ! _patrol_home_dwell "$cam_id" "$cam_name" "$dwell" "$motion_hold" \
+             "$settle_seconds" "$manual_hold" "$dyn_tracking"; then
+          continue  # Interrupted — back to top for hold/tracking checks
+        fi
+      fi
       slot="${presets[$idx]}"
     fi
     if (( waited > 0 && waited < max_wait )); then
@@ -414,5 +498,13 @@ patrol_camera() {
     fi
 
     idx=$(( (idx + 1) % ${#presets[@]} ))
+
+    # Home between cycles: visit home position when cycle wraps back to first preset
+    if [[ "$home_between_cycles" == "true" ]] && (( idx == 0 )); then
+      if ! _patrol_home_dwell "$cam_id" "$cam_name" "$dwell" "$motion_hold" \
+           "$settle_seconds" "$manual_hold" "$dyn_tracking"; then
+        continue  # Interrupted — back to top for hold/tracking checks
+      fi
+    fi
   done
 }

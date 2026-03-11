@@ -161,6 +161,7 @@ for (( i = 0; i < count; i++ )); do
         # Permanent condition (e.g. no presets) — retry infrequently
         log "$cam_name" "warn" "No presets — will re-check in 5 minutes"
         sleep 300
+        cam_json=""  # Clear stale discovery data so next call fetches fresh presets
       else
         log "$cam_name" "warn" "Patrol loop exited — restarting in 10s"
         sleep 10
