@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/iceteaSA/unifi-ptz-better-patrol/blob/main/README.md
+    about: Read the project documentation
+  - name: Security Policy
+    url: https://github.com/iceteaSA/unifi-ptz-better-patrol/blob/main/SECURITY.md
+    about: Report security vulnerabilities
