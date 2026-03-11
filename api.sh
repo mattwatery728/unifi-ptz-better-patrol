@@ -303,21 +303,22 @@ is_tracking() {
     return 0
   }
 
-  # Extract all needed fields in one jq invocation (5→1 process spawn)
+  # Extract all needed fields in one jq invocation (6→1 process spawn)
   local fields
   fields=$(echo "$state" | jq -r '[
     (.id // empty),
     (.state // "UNKNOWN"),
     (.isAutoTracking // .isPtzAutoTracking // .isTracking // false),
-    (.lastSmartDetect // 0),
+    (.isSmartDetected // false),
+    (.isMotionDetected // false),
     (.lastMotion // 0)
   ] | @tsv' 2>/dev/null) || {
     log "$cam_id" "warn" "Invalid camera state response — assuming active (fail-safe)"
     return 0
   }
 
-  local cam_state tracking last_smart last_motion
-  IFS=$'\t' read -r _ cam_state tracking last_smart last_motion <<< "$fields"
+  local cam_state tracking smart_detected motion_detected last_motion
+  IFS=$'\t' read -r _ cam_state tracking smart_detected motion_detected last_motion <<< "$fields"
 
   # Validate we got an id (first field, discarded by _)
   if [[ -z "$cam_state" ]]; then
@@ -337,16 +338,20 @@ is_tracking() {
     return 0
   fi
 
-  local now_ms=$(( $(date +%s) * 1000 ))
-  local hold_ms=$(( motion_hold * 1000 ))
-
-  # Recent smart detection
-  if (( now_ms - last_smart < hold_ms )); then
+  # Real-time smart detection boolean (person/vehicle/animal detected now)
+  if [[ "$smart_detected" == "true" ]]; then
     _LAST_SMART_ACTIVE=1
     return 0
   fi
 
-  # Recent motion as fallback
+  # Real-time motion boolean
+  if [[ "$motion_detected" == "true" ]]; then
+    return 0
+  fi
+
+  # Fallback: lastMotion timestamp for hold window tail
+  local now_ms=$(( $(date +%s) * 1000 ))
+  local hold_ms=$(( motion_hold * 1000 ))
   if (( now_ms - last_motion < hold_ms )); then
     return 0
   fi

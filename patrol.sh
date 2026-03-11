@@ -333,6 +333,10 @@ patrol_camera() {
       tracking_enabled=0
       # Reset zoom baseline since tracking may have moved the camera
       expected_zoom=-1
+      # Advance to next preset — tracking served as the dwell for this one,
+      # so don't snap back to the same position the camera just tracked away from
+      idx=$(( (idx + 1) % ${#presets[@]} ))
+      slot="${presets[$idx]}"
     fi
     if (( waited > 0 && waited < max_wait )); then
       log "$cam_name" "debug" "Clear after ${waited}s — resuming"
