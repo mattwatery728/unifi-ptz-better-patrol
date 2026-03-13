@@ -12,6 +12,7 @@ source "$SCRIPT_DIR/patrol.sh"
 _CHILD_PIDS=()
 _CAMERA_IDS=()
 _DYN_TRACKING_IDS=()
+declare -A _PID_TO_CAMERA=()   # Maps PID → camera_id (for pruning dead cameras)
 _SHUTTING_DOWN=0
 
 shutdown() {
@@ -75,29 +76,60 @@ if [[ "$auto_discover" != "true" ]]; then
 fi
 
 log "main" "info" "Discovering PTZ cameras..."
-cameras=$(discover_ptz_cameras)
-count=$(echo "$cameras" | jq 'length')
+discovery_attempts=0
+discovery_max=10
+discovery_delay=15
+cameras="[]"
+count=0
 
-if (( count == 0 )); then
-  log "main" "error" "No PTZ cameras found"
-  exit 1
-fi
+while (( count == 0 && discovery_attempts < discovery_max )); do
+  discovery_attempts=$(( discovery_attempts + 1 ))
+  cameras=$(discover_ptz_cameras) || cameras="[]"
+  count=$(echo "$cameras" | jq 'length' 2>/dev/null) || count=0
+
+  if (( count == 0 )); then
+    if (( discovery_attempts >= discovery_max )); then
+      log "main" "error" "No PTZ cameras found after $discovery_max attempts — exiting"
+      exit 1
+    fi
+    log "main" "warn" "No PTZ cameras found (attempt $discovery_attempts/$discovery_max) — retrying in ${discovery_delay}s"
+    sleep "$discovery_delay"
+  fi
+done
 
 log "main" "info" "Found $count PTZ camera(s) — launching patrol loops"
 
-# Camera IDs populated in the loop below (used by shutdown handler)
+# ---------------------------------------------------------------------------
+# Per-camera setup & launch (used by initial discovery and re-discovery)
+# ---------------------------------------------------------------------------
 
-for (( i = 0; i < count; i++ )); do
-  cam_id=$(echo "$cameras" | jq -r ".[$i].id")
-  cam_name=$(echo "$cameras" | jq -r ".[$i].name")
-  cam_json=$(echo "$cameras" | jq -c ".[$i]")
+# Set up a single camera and launch its patrol subprocess.
+# Skips cameras that are already being patrolled or disabled in config.
+# Arguments: cameras_json index
+#   cameras_json: full JSON array from discover_ptz_cameras()
+#   index:        0-based index into that array
+launch_patrol_for_camera() {
+  local cameras_json=$1
+  local idx=$2
+
+  local cam_id; cam_id=$(echo "$cameras_json" | jq -r ".[$idx].id")
+  local cam_name; cam_name=$(echo "$cameras_json" | jq -r ".[$idx].name")
+  local cam_json; cam_json=$(echo "$cameras_json" | jq -c ".[$idx]")
+
+  # Already patrolling this camera — skip
+  local existing
+  for existing in "${_CAMERA_IDS[@]}"; do
+    if [[ "$existing" == "$cam_id" ]]; then
+      return 0
+    fi
+  done
 
   # Skip cameras disabled in config
-  cam_config=$(get_camera_config "$cam_id")
-  enabled=$(echo "$cam_config" | jq -r '.enabled // true')
+  local cam_config; cam_config=$(get_camera_config "$cam_id")
+  local enabled; enabled=$(echo "$cam_config" | jq -r '.enabled // true')
   if [[ "$enabled" == "false" ]]; then
     log "main" "info" "$cam_name: disabled in config — skipping"
-    continue
+    return 0
   fi
 
   _CAMERA_IDS+=("$cam_id")
@@ -105,8 +137,9 @@ for (( i = 0; i < count; i++ )); do
   # --- Auto-setup: disable conflicting Protect settings ---
 
   # Disable return-to-home if enabled (interferes with patrol positioning)
-  return_home_ms=$(echo "$cam_json" | jq -r '.return_home_ms // "null"')
+  local return_home_ms; return_home_ms=$(echo "$cam_json" | jq -r '.return_home_ms // "null"')
   if [[ "$return_home_ms" != "null" ]]; then
+    local setup_code
     setup_code=$(api_patch "/cameras/$cam_id" '{"ptz":{"returnHomeAfterInactivityMs":null}}') || true
     if [[ "$setup_code" == "200" ]]; then
       log "main" "info" "$cam_name: disabled auto return-to-home (was ${return_home_ms}ms)"
@@ -116,8 +149,9 @@ for (( i = 0; i < count; i++ )); do
   fi
 
   # Stop active built-in patrol if running (conflicts with our patrol)
-  active_patrol=$(echo "$cam_json" | jq -r '.active_patrol_slot // "null"')
+  local active_patrol; active_patrol=$(echo "$cam_json" | jq -r '.active_patrol_slot // "null"')
   if [[ "$active_patrol" != "null" ]]; then
+    local setup_code
     setup_code=$(api_post "/cameras/$cam_id/ptz/patrol/stop") || true
     if [[ "$setup_code" == "200" || "$setup_code" == "204" ]]; then
       log "main" "info" "$cam_name: stopped built-in patrol (was slot $active_patrol)"
@@ -128,11 +162,12 @@ for (( i = 0; i < count; i++ )); do
 
   # Disable auto-tracking on startup if dynamic tracking is configured
   # (it will be re-enabled dynamically when smart detections occur)
-  dyn_tracking=$(echo "$cam_config" | jq -r '.dynamic_auto_tracking // false')
+  local dyn_tracking; dyn_tracking=$(echo "$cam_config" | jq -r '.dynamic_auto_tracking // false')
   if [[ "$dyn_tracking" == "true" ]]; then
     _DYN_TRACKING_IDS+=("$cam_id")
-    current_types=$(echo "$cam_json" | jq -c '.auto_tracking_types // []')
+    local current_types; current_types=$(echo "$cam_json" | jq -c '.auto_tracking_types // []')
     if [[ "$current_types" != "[]" ]]; then
+      local setup_code
       setup_code=$(api_patch "/cameras/$cam_id" '{"smartDetectSettings":{"autoTrackingObjectTypes":[]}}') || true
       if [[ "$setup_code" == "200" ]]; then
         log "main" "info" "$cam_name: disabled auto-tracking for dynamic mode (was $current_types)"
@@ -170,7 +205,64 @@ for (( i = 0; i < count; i++ )); do
     done
   ) &
   _CHILD_PIDS+=("$!")
+  _PID_TO_CAMERA[$!]="$cam_id"
+  log "main" "info" "$cam_name: patrol launched (PID $!)"
+}
+
+# ---------------------------------------------------------------------------
+# Initial discovery & launch
+# ---------------------------------------------------------------------------
+
+for (( i = 0; i < count; i++ )); do
+  launch_patrol_for_camera "$cameras" "$i"
 done
 
-# Wait for all children (shutdown trap handles SIGTERM)
-wait
+# ---------------------------------------------------------------------------
+# Re-discovery loop: detect new cameras without requiring a service restart
+# ---------------------------------------------------------------------------
+
+rediscovery_interval=$(cfg '.rediscovery_interval_seconds // 600')
+
+if (( rediscovery_interval > 0 )); then
+  log "main" "info" "Re-discovery enabled (every ${rediscovery_interval}s)"
+
+  while true; do
+    sleep "$rediscovery_interval"
+
+    # Prune dead child PIDs, reap zombies, and remove their camera IDs
+    # so re-discovery can relaunch them
+    _LIVE_PIDS=()
+    for pid in "${_CHILD_PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        _LIVE_PIDS+=("$pid")
+      else
+        wait "$pid" 2>/dev/null || true  # reap zombie
+        # Remove the dead camera from _CAMERA_IDS so it can be relaunched
+        dead_cam="${_PID_TO_CAMERA[$pid]:-}"
+        if [[ -n "$dead_cam" ]]; then
+          _KEEP_CAMS=()
+          for cid in "${_CAMERA_IDS[@]}"; do
+            [[ "$cid" != "$dead_cam" ]] && _KEEP_CAMS+=("$cid")
+          done
+          _CAMERA_IDS=("${_KEEP_CAMS[@]}")
+          unset "_PID_TO_CAMERA[$pid]"
+          log "main" "warn" "Camera $dead_cam subprocess (PID $pid) exited — will relaunch on next discovery"
+        fi
+      fi
+    done
+    _CHILD_PIDS=("${_LIVE_PIDS[@]}")
+
+    api_ensure_auth
+
+    log "main" "debug" "Re-discovering PTZ cameras..."
+    new_cameras=$(discover_ptz_cameras) || continue
+    new_count=$(echo "$new_cameras" | jq 'length')
+
+    for (( i = 0; i < new_count; i++ )); do
+      launch_patrol_for_camera "$new_cameras" "$i"
+    done
+  done
+else
+  # No re-discovery — just wait for children (shutdown trap handles SIGTERM)
+  wait
+fi

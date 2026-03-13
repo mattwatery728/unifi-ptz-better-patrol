@@ -4,6 +4,7 @@
   "password": "changeme",
   "reauth_seconds": 3600,
   "auto_discover": true,
+  "rediscovery_interval_seconds": 600,
   "log_level": "info",
 
   "defaults": {
