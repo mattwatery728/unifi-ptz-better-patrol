@@ -11,8 +11,8 @@ Tested with: **G5 PTZ** and **G6 PTZ** cameras only. Other UniFi PTZ models may 
 ## Features
 
 - **Motion-Aware Patrol**: Automatically pauses patrol when motion or smart detection is active
-- **Manual Control Detection**: Detects when you're controlling the camera via the Protect app and backs off — won't interrupt your PTZ session
-- **Active Dwell Monitoring**: Polls for external control and motion every 5 seconds during dwell — reacts within seconds, not minutes
+- **Manual Control Detection**: Detects when you're controlling the camera via the Protect app (any axis — pan, tilt, or zoom) and backs off — won't interrupt your PTZ session
+- **Active Dwell Monitoring**: Polls for external control and motion during dwell with adaptive intervals — reacts within seconds, not minutes
 - **Auto-Tracking Compatible**: Auto-tracking works with this patrol mode — patrol pauses while the camera tracks a subject and resumes when done. UniFi's built-in patrol mode does not support auto-tracking.
 - **Dynamic Auto-Tracking**: Optionally enables auto-tracking only when a smart detection (e.g. person) occurs, then disables it when the detection clears — giving you the best of both worlds (motion events for patrol + tracking when it matters)
 - **Auto-Setup**: Automatically disables conflicting Protect settings on startup (built-in patrols, return-to-home, and static auto-tracking when dynamic mode is enabled)
@@ -91,6 +91,7 @@ Edit `/data/ptz-patrol/config.json`:
   "password": "changeme",
   "reauth_seconds": 3600,
   "auto_discover": true,
+  "rediscovery_interval_seconds": 600,
   "log_level": "info",
 
   "defaults": {
@@ -123,12 +124,13 @@ Edit `/data/ptz-patrol/config.json`:
 | `password` | `changeme` | Local admin password |
 | `reauth_seconds` | `3600` | Token refresh interval (seconds) |
 | `auto_discover` | `true` | Auto-discover PTZ cameras on startup |
+| `rediscovery_interval_seconds` | `600` | Re-discover cameras periodically (seconds); `0` to disable |
 | `log_level` | `info` | Log verbosity: `error`, `warn`, `info`, `debug` |
 | `defaults.dwell_seconds` | `30` | Time at each preset before advancing |
 | `defaults.motion_hold_seconds` | `15` | Hold time after motion/smart detection |
 | `defaults.max_tracking_wait` | `300` | Max seconds to wait during active tracking |
 | `defaults.manual_control_hold_seconds` | `120` | Backoff time after manual PTZ control detected |
-| `defaults.ptz_settle_seconds` | `10` | Grace period after a goto before checking for drift |
+| `defaults.ptz_settle_seconds` | `10` | Grace period after a goto before checking for drift (auto-clamped to `dwell_seconds/2` at startup) |
 | `defaults.home_on_shutdown` | `false` | Send cameras to home position on service stop |
 | `defaults.home_between_cycles` | `false` | Go to home position after completing a full preset cycle before starting again |
 | `defaults.dynamic_auto_tracking` | `false` | Enable dynamic auto-tracking (see below) |
@@ -253,7 +255,7 @@ Log format: `[timestamp] [LEVEL] [tag] message`
            │ no
      ┌─────▼──────┐
      │  External  │──yes──> Hold for manual_control_hold_seconds
-     │  control?  │         (zoom drift detection)
+     │  control?  │         (PTZ position drift detection)
      └─────┬──────┘
            │ no
      ┌─────▼──────┐
@@ -268,43 +270,38 @@ Log format: `[timestamp] [LEVEL] [tag] message`
      │  preset    │ --> Handles HTTP errors (retry, re-auth)
      └─────┬──────┘
            │
-     ┌─────▼──────────────────────────┐
-     │  Dwell (active polling, 5s)   │ <-- NOT a blind sleep
-     │  ├─ Sample actual zoom after  │
-     │  │  settle window             │
-     │  ├─ Check zoom drift          │──> Hold if external control
-     │  └─ Check motion/tracking     │──> Hold if activity detected
-     │     (enable auto-tracking     │    (back to tracking check)
-     │      if smart detection)      │
-     └─────┬──────────────────────────┘
+     ┌─────▼──────────────────────────────┐
+     │  Dwell (adaptive poll interval)   │ <-- NOT a blind sleep
+     │  ├─ Settle window: ignore motor-  │
+     │  │  induced motion after goto     │
+     │  ├─ Check PTZ position drift      │──> Hold if external control
+     │  │  (pan/tilt/zoom vs expected)   │
+     │  └─ Check motion/tracking         │──> Hold if activity detected
+     │     (enable auto-tracking         │    (back to tracking check)
+     │      if smart detection)          │
+     └─────┬──────────────────────────────┘
            │
      next preset ──> (loop)
 ```
 
 ### Manual Control Detection
 
-The Protect API doesn't expose a "camera is being controlled" flag or current pan/tilt position. Detection uses two complementary strategies:
+The Protect API doesn't expose a "camera is being controlled" flag. Detection uses full PTZ position comparison via the `/cameras/{id}/ptz/position` endpoint, which returns live pan, tilt, and zoom values in motor steps — the same coordinate system used by preset definitions.
 
-**Zoom drift detection** catches zoom-based manual control:
+**How it works:**
 
-1. After each `goto`, we wait for the settle window (`ptz_settle_seconds`) to elapse
-2. We then **sample the actual `ispSettings.zoomPosition`** from the camera as the baseline (this avoids zoom scale differences between G5 and G6 models)
-3. During the dwell period, we poll every 5 seconds — if the zoom drifts >2% from the sampled baseline, someone else moved the camera
-4. The patrol enters a hold state for `manual_control_hold_seconds` before resuming
-5. When the hold expires, the baseline is reset so stale values don't cause false re-triggers
+1. After each `goto`, the patrol waits for the settle window (`ptz_settle_seconds`) to let the motor reach its target. Motor-induced motion during this window is filtered out to prevent false triggers.
+2. During the dwell period, the patrol polls at adaptive intervals (`min(5, dwell/3)` seconds, 2s floor) and compares the live pan/tilt/zoom position against the expected preset values.
+3. If any axis drifts beyond the threshold (pan: 200 steps, tilt: 200 steps, zoom: 30 steps), manual control is detected.
+4. The patrol enters a hold state for `manual_control_hold_seconds` before resuming.
+5. For the home position (which has no preset data), the live position is sampled after the settle window as the baseline.
 
-**Motion-based detection** catches pan/tilt manual control:
-
-1. When you pan or tilt a camera from the Protect app, the motor movement causes the scene to change, which triggers the camera's motion sensor
-2. The dwell polling loop checks `isMotionDetected` (real-time boolean) every 5 seconds, with `lastMotion` (timestamp) as a fallback for the hold window tail
-3. If motion is detected during dwell, the patrol holds until motion clears + `motion_hold_seconds` elapses
-
-Together, these two strategies cover the vast majority of manual control scenarios without requiring any additional hardware or Home Assistant integration.
+This catches manual control on **all three axes** — pan, tilt, and zoom — including control from the Protect app, which doesn't trigger `isMotionDetected` for pan/tilt moves. No additional hardware or Home Assistant integration required.
 
 ### Detection Hierarchy
 
 The patrol hold checks these signals in priority order:
-1. **External control** — zoom drift from sampled baseline position
+1. **External control** — pan/tilt/zoom drift from expected preset position
 2. **Auto-tracking flag** (`isAutoTracking`, `isPtzAutoTracking`, `isTracking`) — firmware-dependent, may not exist
 3. **Smart detection** (`isSmartDetected`) — real-time boolean; true when person, vehicle, animal, etc. is actively detected. Sets the internal `_LAST_SMART_ACTIVE` flag used by dynamic auto-tracking
 4. **Motion detection** (`isMotionDetected`) — real-time boolean for active motion; also catches pan/tilt manual control during dwell
@@ -345,12 +342,12 @@ Key operational signals:
 [2026-03-10 12:00:02] [INFO] [Front Door] Patrol: presets=[0 1 2 3] dwell=30s hold=15s max_wait=300s manual_hold=120s
 [2026-03-10 12:00:32] [INFO] [Front Door] → Slot 1 [HTTP 200]
 
-# Zoom-based manual control detection
-[2026-03-10 12:02:00] [WARN] [Front Door] Zoom drift detected (expected=42% actual=78%)
+# PTZ manual control detection (any axis — pan, tilt, or zoom)
+[2026-03-10 12:02:00] [WARN] [Front Door] PTZ drift: pan=22200/18500 tilt=9400/9400 zoom=873/873
 [2026-03-10 12:02:00] [WARN] [Front Door] External control detected — holding patrol for 120s
 [2026-03-10 12:04:00] [INFO] [Front Door] Manual control hold expired — resuming patrol
 
-# Motion during dwell (catches pan/tilt manual control)
+# Motion during dwell
 [2026-03-10 12:05:02] [INFO] [Gate PTZ] Activity during dwell — holding
 [2026-03-10 12:05:02] [INFO] [Gate PTZ] Tracking/motion active — holding
 

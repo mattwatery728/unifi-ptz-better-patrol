@@ -11,11 +11,18 @@ source "$SCRIPT_DIR/discover.sh"
 
 # Detect if someone else is controlling the camera (not us).
 #
-# Strategy:
-#   1. After each goto we record a timestamp and the preset's expected zoom.
-#   2. During dwell, if zoomPosition changes beyond a tolerance AND we are
-#      outside the "settle" window after our last goto → external control.
-#   3. Periodically poll full preset positions and compare pan/tilt/zoom.
+# Strategy: compare the live PTZ position (pan/tilt/zoom in motor steps from
+# the /ptz/position endpoint) against the preset's expected position.  Any
+# axis drifting beyond a threshold while outside the settle window → external.
+#
+# Arguments:
+#   $1  cam_id
+#   $2  cam_name
+#   $3  settle_seconds
+#   $4  last_goto_ts
+#   $5  expected_pan   (steps, -1 = unknown)
+#   $6  expected_tilt  (steps, -1 = unknown)
+#   $7  expected_zoom  (steps, -1 = unknown)
 #
 # Returns 0 (true) if external control is detected.
 is_externally_controlled() {
@@ -23,7 +30,9 @@ is_externally_controlled() {
   local cam_name=$2
   local settle_seconds=$3
   local last_goto_ts=$4
-  local expected_zoom=$5
+  local expected_pan=$5
+  local expected_tilt=$6
+  local expected_zoom=$7
 
   local now; now=$(date +%s)
 
@@ -32,26 +41,48 @@ is_externally_controlled() {
     return 1
   fi
 
-  # Skip check if we have no expected zoom to compare against
-  if (( expected_zoom < 0 )); then
+  # Skip if we have no expected position to compare against
+  if (( expected_pan < 0 && expected_tilt < 0 && expected_zoom < 0 )); then
     return 1
   fi
 
-  # Get current zoom from camera state
-  local current_zoom
-  current_zoom=$(api_get_zoom_position "$cam_id")
+  # Fetch live PTZ position (separate lightweight endpoint, not full camera state)
+  local live_pan live_tilt live_zoom
+  IFS=$'\t' read -r live_pan live_tilt live_zoom <<< "$(api_get_ptz_position "$cam_id")"
 
-  if (( current_zoom < 0 )); then
+  if (( live_pan < 0 )); then
     # Failed to read — fail-safe, don't flag as external
     return 1
   fi
 
-  # Compare zoom: if it differs by more than 2% from expected, someone moved it
-  local zoom_diff=$(( current_zoom - expected_zoom ))
-  zoom_diff=${zoom_diff#-}  # absolute value
+  # Compare each axis.  Thresholds in motor steps:
+  #   pan:  200 steps (~1-2 degrees, depends on model)
+  #   tilt: 200 steps
+  #   zoom: 30  steps (~3% of 0-1000 range)
+  local pan_thresh=200 tilt_thresh=200 zoom_thresh=30
+  local pan_diff=0 tilt_diff=0 zoom_diff=0
+  local drifted=""
 
-  if (( zoom_diff > 2 )); then
-    log "$cam_name" "info" "Zoom drift detected (expected=${expected_zoom}% actual=${current_zoom}%)"
+  if (( expected_pan >= 0 )); then
+    pan_diff=$(( live_pan - expected_pan ))
+    pan_diff=${pan_diff#-}
+    (( pan_diff > pan_thresh )) && drifted+="pan(${expected_pan}→${live_pan}) "
+  fi
+  if (( expected_tilt >= 0 )); then
+    tilt_diff=$(( live_tilt - expected_tilt ))
+    tilt_diff=${tilt_diff#-}
+    (( tilt_diff > tilt_thresh )) && drifted+="tilt(${expected_tilt}→${live_tilt}) "
+  fi
+  if (( expected_zoom >= 0 )); then
+    zoom_diff=$(( live_zoom - expected_zoom ))
+    zoom_diff=${zoom_diff#-}
+    (( zoom_diff > zoom_thresh )) && drifted+="zoom(${expected_zoom}→${live_zoom}) "
+  fi
+
+  log "$cam_name" "debug" "PTZ check: pan=${live_pan}/${expected_pan} tilt=${live_tilt}/${expected_tilt} zoom=${live_zoom}/${expected_zoom}"
+
+  if [[ -n "$drifted" ]]; then
+    log "$cam_name" "info" "PTZ drift detected: ${drifted}"
     return 0
   fi
 
@@ -159,17 +190,18 @@ set_auto_tracking() {
 # a normal preset dwell.
 #
 # Arguments: cam_id cam_name dwell motion_hold settle_seconds manual_hold
-#            dyn_tracking
+#            dyn_tracking poll_interval_s
 #
 # Reads/writes these caller-scope variables directly (not local to this
 # function, shared via bash dynamic scoping):
-#   last_goto_ts  expected_zoom  tracking_enabled  external_control_until
+#   last_goto_ts  expected_pan  expected_tilt  expected_zoom
+#   tracking_enabled  external_control_until
 #
 # Returns 0 if dwell completed normally, 1 if interrupted (caller should
 # continue back to the top of the main patrol loop).
 _patrol_home_dwell() {
   local cam_id=$1 cam_name=$2 dwell=$3 motion_hold=$4 settle_seconds=$5
-  local manual_hold=$6 dyn_tracking=$7
+  local manual_hold=$6 dyn_tracking=$7 poll_iv_s=${8:-5}
 
   local hbc_code
   hbc_code=$(api_post_with_retry "/cameras/$cam_id/ptz/goto/-1" 2 3) || true
@@ -181,31 +213,43 @@ _patrol_home_dwell() {
 
   log "$cam_name" "info" "→ Home (between cycles) [HTTP $hbc_code]"
   last_goto_ts=$(date +%s)
-  expected_zoom=-1
+  # Home position has no preset data — sample live position after settle
+  expected_pan=-1; expected_tilt=-1; expected_zoom=-1
+  local home_sampled=0
 
   local hbc_remaining=$dwell
   while (( hbc_remaining > 0 )); do
     local hbc_poll
-    hbc_poll=$(( hbc_remaining < 5 ? hbc_remaining : 5 ))
+    hbc_poll=$(( hbc_remaining < poll_iv_s ? hbc_remaining : poll_iv_s ))
     sleep "$hbc_poll"
     hbc_remaining=$(( hbc_remaining - hbc_poll ))
 
-    # Sample zoom once after settle window
-    local now
-    now=$(date +%s)
-    if (( expected_zoom < 0 && now - last_goto_ts >= settle_seconds )); then
-      expected_zoom=$(api_get_zoom_position "$cam_id")
+    # Single API fetch per poll cycle (for tracking check).
+    # On failure, skip this poll cycle (fail-safe: hold position).
+    local cam_state=""
+    if api_get_camera_state "$cam_id"; then
+      cam_state="$_CACHED_CAM_STATE"
+    else
+      continue
     fi
 
-    # Check for external control (zoom drift)
-    if is_externally_controlled "$cam_id" "$cam_name" "$settle_seconds" "$last_goto_ts" "$expected_zoom"; then
+    # Sample live position once after settle (home has no preset data)
+    local now
+    now=$(date +%s)
+    if (( home_sampled == 0 && now - last_goto_ts >= settle_seconds )); then
+      IFS=$'\t' read -r expected_pan expected_tilt expected_zoom <<< "$(api_get_ptz_position "$cam_id")"
+      home_sampled=1
+    fi
+
+    # Check for external control (pan/tilt/zoom drift)
+    if is_externally_controlled "$cam_id" "$cam_name" "$settle_seconds" "$last_goto_ts" "$expected_pan" "$expected_tilt" "$expected_zoom"; then
       external_control_until=$(( $(date +%s) + manual_hold ))
       log "$cam_name" "info" "External control detected during home dwell — holding patrol for ${manual_hold}s"
       return 1
     fi
 
-    # Check for motion/tracking
-    if is_tracking "$cam_id" "$motion_hold"; then
+    # Check for motion/tracking (with motor-induced motion filtering)
+    if is_tracking "$cam_id" "$motion_hold" "$last_goto_ts" "$settle_seconds" "$cam_state"; then
       if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 && _LAST_SMART_ACTIVE == 1 )); then
         if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
           tracking_enabled=1
@@ -245,6 +289,26 @@ patrol_camera() {
   max_wait=$(echo "$cam_config" | jq -r '.max_tracking_wait // 300')
   manual_hold=$(echo "$cam_config" | jq -r '.manual_control_hold_seconds // 120')
   settle_seconds=$(echo "$cam_config" | jq -r '.ptz_settle_seconds // 10')
+
+  # --- Sanity-clamp timing relationships ---
+  # Settle must be less than dwell so there are detection windows during dwell.
+  # Clamp to at most dwell/2 (minimum 1s) to guarantee at least 1-2 polls
+  # where external-control and motion detection are actually active.
+  local max_settle=$(( dwell / 2 ))
+  (( max_settle < 1 )) && max_settle=1
+  if (( settle_seconds >= dwell )); then
+    log "$cam_name" "warn" "ptz_settle_seconds ($settle_seconds) >= dwell_seconds ($dwell) — clamping to ${max_settle}s"
+    settle_seconds=$max_settle
+  elif (( settle_seconds > max_settle )); then
+    log "$cam_name" "info" "ptz_settle_seconds ($settle_seconds) > dwell/2 — clamping to ${max_settle}s for better detection"
+    settle_seconds=$max_settle
+  fi
+
+  # Compute adaptive poll interval: min(5, dwell/3) with a 2s floor.
+  # Short dwells need faster polling to get enough detection windows.
+  local poll_interval_s=$(( dwell / 3 ))
+  (( poll_interval_s > 5 )) && poll_interval_s=5
+  (( poll_interval_s < 2 )) && poll_interval_s=2
 
   # Schedule: optional time window for when patrol should be active
   local sched_start sched_end sched_days sched_home
@@ -288,6 +352,11 @@ patrol_camera() {
     return 2  # Permanent condition — caller should not retry frequently
   fi
 
+  # Cache preset positions (pan/tilt/zoom in motor steps) for drift detection.
+  # This JSON array is used by get_preset_ptz() to look up expected positions.
+  local preset_positions
+  preset_positions=$(api_get_preset_positions "$cam_id")
+
   local sched_info=""
   if [[ -n "$sched_start" && -n "$sched_end" ]]; then
     sched_info=" schedule=${sched_start}-${sched_end}"
@@ -305,10 +374,12 @@ patrol_camera() {
   if [[ "$home_between_cycles" == "true" ]]; then
     home_cycle_info=" home_between_cycles=on"
   fi
-  log "$cam_name" "info" "Patrol: presets=[${presets[*]}] dwell=${dwell}s hold=${motion_hold}s max_wait=${max_wait}s manual_hold=${manual_hold}s${sched_info}${dyn_info}${home_cycle_info}"
+  log "$cam_name" "info" "Patrol: presets=[${presets[*]}] dwell=${dwell}s settle=${settle_seconds}s poll=${poll_interval_s}s hold=${motion_hold}s max_wait=${max_wait}s manual_hold=${manual_hold}s${sched_info}${dyn_info}${home_cycle_info}"
 
   local idx=0
   local last_goto_ts=0
+  local expected_pan=-1
+  local expected_tilt=-1
   local expected_zoom=-1
   local external_control_until=0
   local schedule_paused=0
@@ -343,7 +414,7 @@ patrol_camera() {
     if (( schedule_paused == 1 )); then
       log "$cam_name" "info" "Schedule window active (${sched_start}-${sched_end}) — resuming patrol"
       schedule_paused=0
-      expected_zoom=-1
+      expected_pan=-1; expected_tilt=-1; expected_zoom=-1
     fi
 
     # --- Backoff if too many consecutive API failures ---
@@ -364,19 +435,24 @@ patrol_camera() {
       sleep 5
       continue
     elif (( external_control_until > 0 )); then
-      # Hold just expired — reset expected zoom so we don't immediately
-      # re-trigger drift detection against the stale pre-hold value
-      expected_zoom=-1
+      # Hold just expired — reset expected position so we don't immediately
+      # re-trigger drift detection against the stale pre-hold values
+      expected_pan=-1; expected_tilt=-1; expected_zoom=-1
       external_control_until=0
       log "$cam_name" "info" "Manual control hold expired — resuming patrol"
     fi
 
-    # Sample actual zoom once settle window expires (first check after goto)
-    if (( expected_zoom < 0 && now - last_goto_ts >= settle_seconds && last_goto_ts > 0 )); then
-      expected_zoom=$(api_get_zoom_position "$cam_id")
+    # Single API fetch for top-of-loop tracking check.
+    # On failure, sleep and retry next iteration (fail-safe: hold position).
+    local top_state=""
+    if api_get_camera_state "$cam_id"; then
+      top_state="$_CACHED_CAM_STATE"
+    else
+      sleep 5
+      continue
     fi
 
-    if is_externally_controlled "$cam_id" "$cam_name" "$settle_seconds" "$last_goto_ts" "$expected_zoom"; then
+    if is_externally_controlled "$cam_id" "$cam_name" "$settle_seconds" "$last_goto_ts" "$expected_pan" "$expected_tilt" "$expected_zoom"; then
       external_control_until=$(( $(date +%s) + manual_hold ))
       log "$cam_name" "info" "External control detected — holding patrol for ${manual_hold}s"
       sleep 5
@@ -386,7 +462,10 @@ patrol_camera() {
     # --- Hold while tracking/motion is active ---
     local slot="${presets[$idx]}"
     local waited=0
-    while is_tracking "$cam_id" "$motion_hold"; do
+    # First iteration uses the already-fetched top_state; subsequent iterations
+    # fetch fresh state since the camera may have moved during the sleep.
+    while is_tracking "$cam_id" "$motion_hold" "$last_goto_ts" "$settle_seconds" "$top_state"; do
+      top_state=""  # Clear so subsequent iterations fetch fresh state
       if (( waited == 0 )); then
         log "$cam_name" "info" "Tracking/motion active — holding"
       fi
@@ -408,15 +487,15 @@ patrol_camera() {
     if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 1 )); then
       set_auto_tracking "$cam_id" "$cam_name" "[]" "disabled"
       tracking_enabled=0
-      # Reset zoom baseline since tracking may have moved the camera
-      expected_zoom=-1
+      # Reset expected position since tracking may have moved the camera
+      expected_pan=-1; expected_tilt=-1; expected_zoom=-1
       # Advance to next preset — tracking served as the dwell for this one,
       # so don't snap back to the same position the camera just tracked away from
       idx=$(( (idx + 1) % ${#presets[@]} ))
       # Home between cycles: visit home position when cycle wraps
       if [[ "$home_between_cycles" == "true" ]] && (( idx == 0 )); then
         if ! _patrol_home_dwell "$cam_id" "$cam_name" "$dwell" "$motion_hold" \
-             "$settle_seconds" "$manual_hold" "$dyn_tracking"; then
+             "$settle_seconds" "$manual_hold" "$dyn_tracking" "$poll_interval_s"; then
           continue  # Interrupted — back to top for hold/tracking checks
         fi
       fi
@@ -433,10 +512,10 @@ patrol_camera() {
     case "$code" in
       200|204)
         last_goto_ts=$(date +%s)
-        # Mark zoom unknown until settle completes — we'll sample the actual
-        # ISP zoom after the settle window rather than computing from preset
-        # data (zoom scale mapping varies between G5 and G6 models).
-        expected_zoom=-1
+        # Set expected position from preset data.  is_externally_controlled()
+        # compares these against the live /ptz/position (motor steps), so the
+        # coordinate system matches directly — no ISP zoom scaling needed.
+        IFS=$'\t' read -r expected_pan expected_tilt expected_zoom <<< "$(get_preset_ptz "$preset_positions" "$slot")"
         log "$cam_name" "info" "→ Slot $slot [HTTP $code]"
         ;;
       404)
@@ -454,24 +533,27 @@ patrol_camera() {
         ;;
     esac
 
-    # Dwell at current preset, polling for external control and motion every 5s.
-    # This replaces a blind sleep so we can react promptly to manual PTZ use
-    # or new motion/tracking activity.
+    # Dwell at current preset, polling for external control and motion.
+    # Dwell at current preset, polling for PTZ drift and motion.
+    # Uses adaptive poll_interval_s and the /ptz/position endpoint to detect
+    # pan/tilt/zoom changes (manual control via the Protect app).
     local dwell_remaining=$dwell
     local dwell_interrupted=0
     while (( dwell_remaining > 0 )); do
-      local poll_interval=$(( dwell_remaining < 5 ? dwell_remaining : 5 ))
-      sleep "$poll_interval"
-      dwell_remaining=$(( dwell_remaining - poll_interval ))
+      local poll_iv=$(( dwell_remaining < poll_interval_s ? dwell_remaining : poll_interval_s ))
+      sleep "$poll_iv"
+      dwell_remaining=$(( dwell_remaining - poll_iv ))
 
-      # Sample zoom once after settle if not yet done
-      now=$(date +%s)
-      if (( expected_zoom < 0 && now - last_goto_ts >= settle_seconds )); then
-        expected_zoom=$(api_get_zoom_position "$cam_id")
+      # Single camera state fetch for tracking check (fail-safe: hold position).
+      local cam_state=""
+      if api_get_camera_state "$cam_id"; then
+        cam_state="$_CACHED_CAM_STATE"
+      else
+        continue
       fi
 
-      # Check for external control during dwell (zoom drift)
-      if is_externally_controlled "$cam_id" "$cam_name" "$settle_seconds" "$last_goto_ts" "$expected_zoom"; then
+      # Check for external control during dwell (pan/tilt/zoom drift via /ptz/position)
+      if is_externally_controlled "$cam_id" "$cam_name" "$settle_seconds" "$last_goto_ts" "$expected_pan" "$expected_tilt" "$expected_zoom"; then
         external_control_until=$(( $(date +%s) + manual_hold ))
         log "$cam_name" "info" "External control detected — holding patrol for ${manual_hold}s"
         dwell_interrupted=1
@@ -479,8 +561,9 @@ patrol_camera() {
       fi
 
       # Check for new motion/tracking during dwell (catches pan/tilt manual
-      # control since motor movement triggers the motion sensor)
-      if is_tracking "$cam_id" "$motion_hold"; then
+      # control since motor movement triggers the motion sensor).
+      # Pass last_goto_ts + settle_seconds so motor-induced motion is filtered.
+      if is_tracking "$cam_id" "$motion_hold" "$last_goto_ts" "$settle_seconds" "$cam_state"; then
         # Dynamic auto-tracking: enable when smart detection fires during dwell
         if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 && _LAST_SMART_ACTIVE == 1 )); then
           if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
@@ -502,7 +585,7 @@ patrol_camera() {
     # Home between cycles: visit home position when cycle wraps back to first preset
     if [[ "$home_between_cycles" == "true" ]] && (( idx == 0 )); then
       if ! _patrol_home_dwell "$cam_id" "$cam_name" "$dwell" "$motion_hold" \
-           "$settle_seconds" "$manual_hold" "$dyn_tracking"; then
+           "$settle_seconds" "$manual_hold" "$dyn_tracking" "$poll_interval_s"; then
         continue  # Interrupted — back to top for hold/tracking checks
       fi
     fi

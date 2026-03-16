@@ -283,25 +283,58 @@ api_backoff_delay() {
 }
 
 # ---------------------------------------------------------------------------
+# Camera state fetch (shared between tracking and zoom checks)
+# ---------------------------------------------------------------------------
+
+# Fetch full camera state JSON once per poll cycle.  Returns 0 on success,
+# 1 on failure.  The raw JSON is stored in the global _CACHED_CAM_STATE so
+# parse_* helpers and is_tracking can consume it without a second
+# HTTP round-trip.
+_CACHED_CAM_STATE=""
+
+api_get_camera_state() {
+  local cam_id=$1
+  _CACHED_CAM_STATE=""
+  _CACHED_CAM_STATE=$(api_get_with_retry "/cameras/$cam_id" 2 3) || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Tracking / motion detection
 # ---------------------------------------------------------------------------
 
 # Returns 0 (true) if camera appears to be tracking or has recent activity.
 # Extracts all needed fields in a single jq call to minimise process spawning
 # on resource-constrained UniFi hardware.
+#
+# Arguments:
+#   $1  cam_id
+#   $2  motion_hold          — seconds to extend detection after lastMotion
+#   $3  last_goto_ts         — (optional) epoch when we last sent a goto command
+#   $4  settle_seconds       — (optional) settle window after goto
+#   $5  pre_fetched_state    — (optional) JSON from api_get_camera_state()
+#
+# When last_goto_ts and settle_seconds are provided, lastMotion timestamps
+# that fall within the settle window after our goto are ignored — the motor
+# movement itself triggers the motion sensor, which is not real activity.
+#
 # Side-effect: sets _LAST_SMART_ACTIVE=1 if smart detection (AI) is active,
 #              0 otherwise. Used by dynamic auto-tracking to avoid a second API call.
 _LAST_SMART_ACTIVE=0
 
 is_tracking() {
   local cam_id=$1 motion_hold=$2
+  local last_goto_ts=${3:-0}
+  local settle_seconds=${4:-0}
+  local state=${5:-}
   _LAST_SMART_ACTIVE=0
 
-  local state
-  state=$(api_get_with_retry "/cameras/$cam_id" 2 3) || {
-    log "$cam_id" "warn" "Failed to fetch camera state — assuming active (fail-safe)"
-    return 0
-  }
+  if [[ -z "$state" ]]; then
+    state=$(api_get_with_retry "/cameras/$cam_id" 2 3) || {
+      log "$cam_id" "warn" "Failed to fetch camera state — assuming active (fail-safe)"
+      return 0
+    }
+  fi
 
   # Extract all needed fields in one jq invocation (6→1 process spawn)
   local fields
@@ -344,15 +377,36 @@ is_tracking() {
     return 0
   fi
 
-  # Real-time motion boolean
+  # Capture time once for both motion checks below (avoid redundant date spawns).
+  local now_s; now_s=$(date +%s)
+
+  # Real-time motion boolean — but ignore if we're still within the settle
+  # window after our own goto (motor movement triggers the sensor).
   if [[ "$motion_detected" == "true" ]]; then
-    return 0
+    if (( last_goto_ts > 0 && now_s - last_goto_ts < settle_seconds )); then
+      log "$cam_id" "debug" "Ignoring isMotionDetected during settle window (motor-induced)"
+    else
+      return 0
+    fi
   fi
 
-  # Fallback: lastMotion timestamp for hold window tail
-  local now_ms=$(( $(date +%s) * 1000 ))
+  # Fallback: lastMotion timestamp for hold window tail.
+  # Skip if lastMotion falls within the settle window after our last goto —
+  # the motor physically moving to a preset triggers the motion sensor and
+  # updates lastMotion. Without this filter, motion_hold > dwell causes a
+  # permanent hold loop because every goto refreshes lastMotion.
+  local now_ms=$(( now_s * 1000 ))
   local hold_ms=$(( motion_hold * 1000 ))
   if (( now_ms - last_motion < hold_ms )); then
+    # Check if this lastMotion event is just our own motor movement
+    if (( last_goto_ts > 0 )); then
+      local goto_ms=$(( last_goto_ts * 1000 ))
+      local settle_ms=$(( settle_seconds * 1000 ))
+      if (( last_motion >= goto_ms && last_motion <= goto_ms + settle_ms )); then
+        # lastMotion is within [goto, goto+settle] — motor-induced, ignore
+        return 1
+      fi
+    fi
     return 0
   fi
 
@@ -363,17 +417,6 @@ is_tracking() {
 # PTZ position queries (for manual control detection)
 # ---------------------------------------------------------------------------
 
-# Get current zoom position (0-100) from camera ISP settings (rounded to int).
-# Returns -1 on failure so callers can detect and skip the check.
-api_get_zoom_position() {
-  local cam_id=$1
-  local state
-  state=$(api_get_with_retry "/cameras/$cam_id" 2 3) || { echo "-1"; return; }
-  local zoom
-  zoom=$(echo "$state" | jq -r '(.ispSettings.zoomPosition // -1) | floor')
-  echo "${zoom:--1}"
-}
-
 # Get preset positions: returns JSON array [{slot, pan, tilt, zoom}, ...]
 api_get_preset_positions() {
   local cam_id=$1
@@ -382,15 +425,27 @@ api_get_preset_positions() {
   echo "$raw" | jq '[.[] | {slot: .slot, name: .name, pan: .ptz.pan, tilt: .ptz.tilt, zoom: .ptz.zoom}]' 2>/dev/null || echo "[]"
 }
 
-# Get the expected zoom for a given preset slot from a cached preset JSON array,
-# normalized to the ISP percentage scale (0-100).
-# Preset zoom values from /ptz/preset are 0-1000; ispSettings.zoomPosition is 0-100.
-# Usage: preset_zoom=$(get_preset_zoom "$preset_json" "$slot")
-get_preset_zoom() {
+# Get live PTZ position (pan/tilt/zoom in steps) from the /ptz/position endpoint.
+# Echoes a tab-separated line: pan_steps tilt_steps zoom_steps
+# Echoes "-1 -1 -1" on failure.
+api_get_ptz_position() {
+  local cam_id=$1
+  local raw
+  raw=$(api_get_with_retry "/cameras/$cam_id/ptz/position" 2 3) || { echo "-1	-1	-1"; return; }
+  local fields
+  fields=$(echo "$raw" | jq -r '[.steps.pan // -1, .steps.tilt // -1, .steps.zoom // -1] | @tsv' 2>/dev/null) || { echo "-1	-1	-1"; return; }
+  echo "$fields"
+}
+
+# Get the expected pan/tilt/zoom (in steps) for a preset slot from cached preset JSON.
+# Echoes tab-separated: pan tilt zoom.  Echoes "-1 -1 -1" if slot not found.
+get_preset_ptz() {
   local preset_json=$1
   local slot=$2
-  local zoom
-  zoom=$(echo "$preset_json" | jq -r --argjson s "$slot" \
-    '.[] | select(.slot == $s) | ((.zoom // -10) / 10) | floor')
-  echo "${zoom:--1}"
+  local fields
+  fields=$(echo "$preset_json" | jq -r --argjson s "$slot" \
+    '.[] | select(.slot == $s) | [(.pan // -1), (.tilt // -1), (.zoom // -1)] | @tsv' 2>/dev/null)
+  echo "${fields:--1	-1	-1}"
 }
+
+
