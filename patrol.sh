@@ -217,6 +217,13 @@ _patrol_home_dwell() {
   expected_pan=-1; expected_tilt=-1; expected_zoom=-1
   local home_sampled=0
 
+  # Proactively enable auto-tracking at home position
+  if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 )); then
+    if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
+      tracking_enabled=1
+    fi
+  fi
+
   local hbc_remaining=$dwell
   while (( hbc_remaining > 0 )); do
     local hbc_poll
@@ -241,20 +248,18 @@ _patrol_home_dwell() {
       home_sampled=1
     fi
 
-    # Check for external control (pan/tilt/zoom drift)
-    if is_externally_controlled "$cam_id" "$cam_name" "$settle_seconds" "$last_goto_ts" "$expected_pan" "$expected_tilt" "$expected_zoom"; then
-      external_control_until=$(( $(date +%s) + manual_hold ))
-      log "$cam_name" "info" "External control detected during home dwell — holding patrol for ${manual_hold}s"
-      return 1
+    # Check for external control (pan/tilt/zoom drift).
+    # Skip when auto-tracking is enabled — the camera may have moved to track.
+    if (( tracking_enabled == 0 )); then
+      if is_externally_controlled "$cam_id" "$cam_name" "$settle_seconds" "$last_goto_ts" "$expected_pan" "$expected_tilt" "$expected_zoom"; then
+        external_control_until=$(( $(date +%s) + manual_hold ))
+        log "$cam_name" "info" "External control detected during home dwell — holding patrol for ${manual_hold}s"
+        return 1
+      fi
     fi
 
     # Check for motion/tracking (with motor-induced motion filtering)
     if is_tracking "$cam_id" "$motion_hold" "$last_goto_ts" "$settle_seconds" "$cam_state"; then
-      if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 && _LAST_SMART_ACTIVE == 1 )); then
-        if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
-          tracking_enabled=1
-        fi
-      fi
       log "$cam_name" "info" "Activity during home dwell — holding"
       return 1
     fi
@@ -469,12 +474,6 @@ patrol_camera() {
       if (( waited == 0 )); then
         log "$cam_name" "info" "Tracking/motion active — holding"
       fi
-      # Dynamic auto-tracking: enable when smart detection is active
-      if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 && _LAST_SMART_ACTIVE == 1 )); then
-        if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
-          tracking_enabled=1
-        fi
-      fi
       sleep 5
       waited=$((waited + 5))
       api_ensure_auth
@@ -506,6 +505,13 @@ patrol_camera() {
     fi
 
     # --- Move to next preset ---
+    # Disable auto-tracking before moving so the camera doesn't try to track
+    # while transiting to the new preset position.
+    if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 1 )); then
+      set_auto_tracking "$cam_id" "$cam_name" "[]" "disabled"
+      tracking_enabled=0
+    fi
+
     local code
     code=$(api_post_with_retry "/cameras/$cam_id/ptz/goto/$slot" 2 3) || true
 
@@ -533,7 +539,14 @@ patrol_camera() {
         ;;
     esac
 
-    # Dwell at current preset, polling for external control and motion.
+    # Proactively enable auto-tracking so the camera can track immediately
+    # when a smart detection fires, without waiting for a poll to catch it.
+    if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 )); then
+      if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
+        tracking_enabled=1
+      fi
+    fi
+
     # Dwell at current preset, polling for PTZ drift and motion.
     # Uses adaptive poll_interval_s and the /ptz/position endpoint to detect
     # pan/tilt/zoom changes (manual control via the Protect app).
@@ -552,24 +565,22 @@ patrol_camera() {
         continue
       fi
 
-      # Check for external control during dwell (pan/tilt/zoom drift via /ptz/position)
-      if is_externally_controlled "$cam_id" "$cam_name" "$settle_seconds" "$last_goto_ts" "$expected_pan" "$expected_tilt" "$expected_zoom"; then
-        external_control_until=$(( $(date +%s) + manual_hold ))
-        log "$cam_name" "info" "External control detected — holding patrol for ${manual_hold}s"
-        dwell_interrupted=1
-        break
+      # Check for external control during dwell (pan/tilt/zoom drift via /ptz/position).
+      # Skip when auto-tracking is enabled — the camera may have moved to track a
+      # target, which is not external control.  is_tracking() will catch the activity.
+      if (( tracking_enabled == 0 )); then
+        if is_externally_controlled "$cam_id" "$cam_name" "$settle_seconds" "$last_goto_ts" "$expected_pan" "$expected_tilt" "$expected_zoom"; then
+          external_control_until=$(( $(date +%s) + manual_hold ))
+          log "$cam_name" "info" "External control detected — holding patrol for ${manual_hold}s"
+          dwell_interrupted=1
+          break
+        fi
       fi
 
       # Check for new motion/tracking during dwell (catches pan/tilt manual
       # control since motor movement triggers the motion sensor).
       # Pass last_goto_ts + settle_seconds so motor-induced motion is filtered.
       if is_tracking "$cam_id" "$motion_hold" "$last_goto_ts" "$settle_seconds" "$cam_state"; then
-        # Dynamic auto-tracking: enable when smart detection fires during dwell
-        if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 && _LAST_SMART_ACTIVE == 1 )); then
-          if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
-            tracking_enabled=1
-          fi
-        fi
         log "$cam_name" "info" "Activity during dwell — holding"
         dwell_interrupted=1
         break

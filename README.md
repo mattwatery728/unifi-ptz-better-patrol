@@ -14,7 +14,7 @@ Tested with: **G5 PTZ** and **G6 PTZ** cameras only. Other UniFi PTZ models may 
 - **Manual Control Detection**: Detects when you're controlling the camera via the Protect app (any axis — pan, tilt, or zoom) and backs off — won't interrupt your PTZ session
 - **Active Dwell Monitoring**: Polls for external control and motion during dwell with adaptive intervals — reacts within seconds, not minutes
 - **Auto-Tracking Compatible**: Auto-tracking works with this patrol mode — patrol pauses while the camera tracks a subject and resumes when done. UniFi's built-in patrol mode does not support auto-tracking.
-- **Dynamic Auto-Tracking**: Optionally enables auto-tracking only when a smart detection (e.g. person) occurs, then disables it when the detection clears — giving you the best of both worlds (motion events for patrol + tracking when it matters)
+- **Dynamic Auto-Tracking**: Optionally enables auto-tracking at each preset so the camera can immediately track a person — disables it before advancing to the next preset so motion events resume for the patrol cycle
 - **Auto-Setup**: Automatically disables conflicting Protect settings on startup (built-in patrols, return-to-home, and static auto-tracking when dynamic mode is enabled)
 - **Auto-Discovery**: Finds all connected PTZ cameras and their preset positions automatically
 - **Per-Camera Overrides**: Customize dwell time, motion hold, and preset slots per camera
@@ -195,7 +195,7 @@ If no `schedule` is set (or set to `null`), patrol runs continuously. Per-camera
 
 UniFi Protect suppresses motion events when auto-tracking is enabled (the camera is moving, so there's no relative motion in the frame). This creates a problem: you can't have both motion-aware patrol and auto-tracking at the same time.
 
-Dynamic auto-tracking solves this by keeping auto-tracking **disabled by default** and only enabling it when a smart detection (e.g. person) is actively occurring. When the detection clears, it disables tracking again so motion events resume for the next patrol cycle.
+Dynamic auto-tracking solves this by toggling auto-tracking around each preset visit: **enabled** after arriving at a preset (so the camera can immediately track a person without waiting for a poll), and **disabled** before advancing to the next preset (so motion events resume for the patrol cycle).
 
 ```json
 {
@@ -210,10 +210,12 @@ Dynamic auto-tracking solves this by keeping auto-tracking **disabled by default
 | `dynamic_auto_tracking` | `false` | Enable dynamic auto-tracking (person detection only) |
 
 When enabled, the script will:
-1. Disable auto-tracking on the camera at startup
-2. Enable it when a smart detection (person) occurs — patrol holds while the camera tracks
-3. Disable it when the detection clears — patrol advances to the **next** preset (not back to the one the camera tracked away from)
-4. Disable it on shutdown and schedule pause
+1. Disable auto-tracking on the camera at startup (clean slate)
+2. After each `goto`, enable auto-tracking — camera is immediately ready to track a person
+3. Before advancing to the next preset, disable auto-tracking — motion events resume
+4. If the camera tracks a target, patrol holds until detection clears, then advances to the **next** preset (not back to the one the camera tracked away from)
+5. Disable auto-tracking on shutdown and schedule pause
+6. PTZ drift detection is suppressed while tracking is enabled (camera movement from tracking is not external control)
 
 This is per-camera configurable — you can enable it on specific cameras via `camera_overrides`.
 
@@ -259,26 +261,35 @@ Log format: `[timestamp] [LEVEL] [tag] message`
      └─────┬──────┘
            │ no
      ┌─────▼──────┐
-     │  Tracking  │──yes──┬──> Hold (check every 5s, up to max_wait)
-     │  active?   │       └──> Enable auto-tracking if smart detection
-     └─────┬──────┘            (dynamic mode only)
+     │  Tracking  │──yes──> Hold (check every 5s, up to max_wait)
+     │  active?   │
+     └─────┬──────┘
            │ no
            │ (disable auto-tracking if was enabled;
            │  advance to next preset)
+     ┌─────▼──────────┐
+     │  Disable       │ <-- only if dynamic auto-tracking
+     │  auto-tracking │
+     └─────┬──────────┘
+           │
      ┌─────▼──────┐
      │  Go to     │ --> Records timestamp
      │  preset    │ --> Handles HTTP errors (retry, re-auth)
      └─────┬──────┘
+           │
+     ┌─────▼──────────┐
+     │  Enable        │ <-- only if dynamic auto-tracking
+     │  auto-tracking │     (camera ready to track immediately)
+     └─────┬──────────┘
            │
      ┌─────▼──────────────────────────────┐
      │  Dwell (adaptive poll interval)   │ <-- NOT a blind sleep
      │  ├─ Settle window: ignore motor-  │
      │  │  induced motion after goto     │
      │  ├─ Check PTZ position drift      │──> Hold if external control
-     │  │  (pan/tilt/zoom vs expected)   │
+     │  │  (pan/tilt/zoom vs expected)   │    (skipped when tracking)
      │  └─ Check motion/tracking         │──> Hold if activity detected
-     │     (enable auto-tracking         │    (back to tracking check)
-     │      if smart detection)          │
+     │                                   │    (back to tracking check)
      └─────┬──────────────────────────────┘
            │
      next preset ──> (loop)
@@ -360,12 +371,15 @@ Key operational signals:
 [2026-03-10 12:10:00] [WARN] [Driveway] 3 consecutive failures — backing off 20s
 [2026-03-10 12:10:20] [WARN] [Driveway] Patrol loop exited — restarting in 10s
 
-# Dynamic auto-tracking cycle
+# Dynamic auto-tracking cycle (enable at preset, disable before advance)
+[2026-03-10 12:10:00] [INFO] [Driveway] → Slot 3 [HTTP 200]
 [2026-03-10 12:10:00] [INFO] [Driveway] Auto-tracking enabled (["person"])
-[2026-03-10 12:10:00] [INFO] [Driveway] Tracking/motion active — holding
-[2026-03-10 12:11:05] [INFO] [Driveway] Auto-tracking disabled ([])
+[2026-03-10 12:10:05] [INFO] [Driveway] Activity during dwell — holding
+[2026-03-10 12:10:05] [INFO] [Driveway] Tracking/motion active — holding
 [2026-03-10 12:11:05] [DEBUG] [Driveway] Clear after 65s — resuming
+[2026-03-10 12:11:05] [INFO] [Driveway] Auto-tracking disabled ([])
 [2026-03-10 12:11:05] [INFO] [Driveway] → Slot 4 [HTTP 200]
+[2026-03-10 12:11:06] [INFO] [Driveway] Auto-tracking enabled (["person"])
 
 # Auto-setup on startup
 [2026-03-10 12:00:01] [INFO] [main] Front Door: disabled auto-tracking for dynamic mode (was ["person"])
