@@ -217,13 +217,6 @@ _patrol_home_dwell() {
   expected_pan=-1; expected_tilt=-1; expected_zoom=-1
   local home_sampled=0
 
-  # Proactively enable auto-tracking at home position
-  if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 )); then
-    if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
-      tracking_enabled=1
-    fi
-  fi
-
   local hbc_remaining=$dwell
   while (( hbc_remaining > 0 )); do
     local hbc_poll
@@ -390,6 +383,14 @@ patrol_camera() {
   local schedule_paused=0
   local tracking_enabled=0
 
+  # Enable auto-tracking once at patrol start (stays on permanently).
+  # Only disabled on schedule pause and shutdown.
+  if [[ "$dyn_tracking" == "true" ]]; then
+    if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
+      tracking_enabled=1
+    fi
+  fi
+
   while true; do
     api_ensure_auth
 
@@ -420,6 +421,12 @@ patrol_camera() {
       log "$cam_name" "info" "Schedule window active (${sched_start}-${sched_end}) — resuming patrol"
       schedule_paused=0
       expected_pan=-1; expected_tilt=-1; expected_zoom=-1
+      # Re-enable auto-tracking after schedule pause
+      if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 )); then
+        if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
+          tracking_enabled=1
+        fi
+      fi
     fi
 
     # --- Backoff if too many consecutive API failures ---
@@ -482,11 +489,9 @@ patrol_camera() {
         break
       fi
     done
-    # Dynamic auto-tracking: disable when detection clears
-    if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 1 )); then
-      set_auto_tracking "$cam_id" "$cam_name" "[]" "disabled"
-      tracking_enabled=0
-      # Reset expected position since tracking may have moved the camera
+    # Dynamic auto-tracking: tracking may have moved the camera, so reset
+    # expected position and advance to next preset (don't snap back).
+    if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 1 && waited > 0 )); then
       expected_pan=-1; expected_tilt=-1; expected_zoom=-1
       # Advance to next preset — tracking served as the dwell for this one,
       # so don't snap back to the same position the camera just tracked away from
@@ -505,13 +510,6 @@ patrol_camera() {
     fi
 
     # --- Move to next preset ---
-    # Disable auto-tracking before moving so the camera doesn't try to track
-    # while transiting to the new preset position.
-    if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 1 )); then
-      set_auto_tracking "$cam_id" "$cam_name" "[]" "disabled"
-      tracking_enabled=0
-    fi
-
     local code
     code=$(api_post_with_retry "/cameras/$cam_id/ptz/goto/$slot" 2 3) || true
 
@@ -538,14 +536,6 @@ patrol_camera() {
         log "$cam_name" "warn" "Unexpected HTTP $code on goto slot $slot"
         ;;
     esac
-
-    # Proactively enable auto-tracking so the camera can track immediately
-    # when a smart detection fires, without waiting for a poll to catch it.
-    if [[ "$dyn_tracking" == "true" ]] && (( tracking_enabled == 0 )); then
-      if set_auto_tracking "$cam_id" "$cam_name" '["person"]' "enabled"; then
-        tracking_enabled=1
-      fi
-    fi
 
     # Dwell at current preset, polling for PTZ drift and motion.
     # Uses adaptive poll_interval_s and the /ptz/position endpoint to detect
